@@ -1,0 +1,92 @@
+#!/bin/sh
+
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+
+TAG=notify
+DEFAULT_QUEUE_DIR=/overlay/notify-queue
+MAX_MESSAGE_BYTES=4096
+MAX_FILES=5000
+
+log_error() { logger -t "$TAG" -- "$*"; }
+cfg() { uci -q get "notify.main.$1" 2>/dev/null || printf '%s' "$2"; }
+
+level=info
+while getopts "l:" opt; do
+	case "$opt" in
+		l) level=$OPTARG ;;
+		*) echo "Usage: notify [-l info|warning|error|critical] MESSAGE" >&2; exit 2 ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+case "$level" in info|warning|error|critical) : ;; *) log_error "invalid level"; exit 2 ;; esac
+[ "$#" -gt 0 ] || { log_error "empty notification rejected"; exit 2; }
+message=$1
+shift
+for part in "$@"; do message="$message $part"; done
+[ -n "$message" ] || { log_error "empty notification rejected"; exit 2; }
+message_bytes=$(printf '%s' "$message" | wc -c | tr -d ' ')
+[ "$message_bytes" -le "$MAX_MESSAGE_BYTES" ] || { log_error "notification exceeds 4096-byte message limit"; exit 1; }
+
+queue_dir=$(cfg queue_dir "$DEFAULT_QUEUE_DIR")
+max_files=$(cfg max_files "$MAX_FILES")
+max_bytes=$(cfg max_queue_bytes 10485760)
+case "$max_files" in ''|*[!0-9]*) max_files=$MAX_FILES ;; esac
+case "$max_bytes" in ''|*[!0-9]*) max_bytes=10485760 ;; esac
+
+for dir in "$queue_dir" "$queue_dir/tmp" "$queue_dir/new" "$queue_dir/failed"; do
+	mkdir -p "$dir" || { log_error "cannot create queue directory"; exit 1; }
+done
+
+timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
+hostname_value=$(uci -q get 'system.@system[0].hostname' 2>/dev/null)
+[ -n "$hostname_value" ] || hostname_value=$(hostname 2>/dev/null || echo OpenWrt)
+epoch=$(date +%s)
+counter=0
+while :; do
+	random=${RANDOM:-$(awk 'BEGIN{srand(); print int(rand()*1000000)}' 2>/dev/null)}
+	name="${epoch}-$$-${random}-${counter}.msg"
+	tmp="$queue_dir/tmp/$name"
+	( set -C; : > "$tmp" ) 2>/dev/null && break
+	counter=$((counter + 1))
+	[ "$counter" -lt 100 ] || { log_error "cannot allocate unique queue file"; exit 1; }
+done
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
+{
+	printf 'timestamp=%s\n' "$timestamp"
+	printf 'hostname=%s\n' "$hostname_value" | tr '\r\n' '  '
+	printf '\nlevel=%s\nattempts=0\n\n' "$level"
+	printf '%s\n' "$message"
+} > "$tmp" || { log_error "cannot write notification"; exit 1; }
+
+size=$(wc -c < "$tmp" | tr -d ' ')
+
+queue_count=$(find "$queue_dir/new" -type f -name '*.msg' 2>/dev/null | wc -l | tr -d ' ')
+queue_bytes=$(du -sk "$queue_dir/new" 2>/dev/null | awk '{print $1 * 1024}')
+queue_bytes=${queue_bytes:-0}
+if [ "$queue_count" -ge "$max_files" ] || [ $((queue_bytes + size)) -gt "$max_bytes" ]; then
+	# Preserve warning/error/critical. Reclaim only the oldest info notification.
+	old_info=''
+	for candidate in $(find "$queue_dir/new" -type f -name '*.msg' 2>/dev/null | sort); do
+		[ -L "$candidate" ] && continue
+		grep -q '^level=info$' "$candidate" 2>/dev/null && { old_info=$candidate; break; }
+	done
+	if [ -n "$old_info" ]; then
+		rm -f "$old_info" || { log_error "queue full; cannot remove oldest info notification"; exit 1; }
+		logger -t "$TAG" -- "queue full; oldest info notification removed"
+	else
+		log_error "queue full; notification rejected"
+		exit 1
+	fi
+fi
+
+mv "$tmp" "$queue_dir/new/$name" || { log_error "cannot commit notification"; exit 1; }
+trap - EXIT HUP INT TERM
+logger -t "$TAG" -- "notification queued (level=$level, file=$name)"
+exit 0
